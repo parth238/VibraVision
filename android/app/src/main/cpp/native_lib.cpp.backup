@@ -1,0 +1,125 @@
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <vector>
+#include <numeric>
+#include <cmath>
+#include <cstring>
+
+extern "C" {
+    
+    static cv::Mat prev_gray;
+    static std::vector<double> brightness_history;
+    static const int HISTORY_SIZE = 64;
+
+    // NEW: SMOOTHING VARIABLES (To fix the "Jumpy Meter")
+    static double smoothed_score = 0.0;
+    static double smoothed_hz = 0.0;
+
+    __attribute__((visibility("default"))) __attribute__((used))
+    int process_frame(uint8_t* inputBytes, int width, int height, uint8_t* outputBytes, 
+                      double* vibrationScore, double* frequencyHz, int sensitivity) {
+        
+        cv::Mat gray(height, width, CV_8UC1, inputBytes);
+        
+        if (brightness_history.empty()) {
+            brightness_history.reserve(HISTORY_SIZE);
+        }
+
+        if (prev_gray.empty() || prev_gray.size() != gray.size()) {
+            gray.copyTo(prev_gray);
+            *vibrationScore = 0.0;
+            *frequencyHz = 0.0;
+            return 0;
+        }
+
+        // --- PART A: INTENSITY ---
+        cv::Mat diff;
+        cv::absdiff(gray, prev_gray, diff);
+        cv::Scalar meanMotion = cv::mean(diff);
+        double raw_score = meanMotion[0];
+
+        // SMOOTHING FIX 1: Exponential Moving Average for Intensity
+        // Takes 20% of new value, 80% of old value. Makes the bar move naturally.
+        smoothed_score = (smoothed_score * 0.8) + (raw_score * 0.2);
+        *vibrationScore = smoothed_score; 
+
+        // --- PART B: FREQUENCY (FFT) ---
+        cv::Scalar meanBrightness = cv::mean(gray);
+        brightness_history.push_back(meanBrightness[0]);
+
+        if (brightness_history.size() > HISTORY_SIZE) {
+            brightness_history.erase(brightness_history.begin());
+        }
+
+        double raw_hz = 0.0;
+
+        if (brightness_history.size() == HISTORY_SIZE) {
+            cv::Mat dftInput(HISTORY_SIZE, 1, CV_64F);
+            for (int i = 0; i < HISTORY_SIZE; i++) {
+                dftInput.at<double>(i, 0) = brightness_history[i];
+            }
+
+            cv::Mat dftOutput;
+            cv::dft(dftInput, dftOutput, cv::DFT_COMPLEX_OUTPUT);
+
+            double maxVal = 0.0;
+            int maxIndex = 0;
+            
+            for (int i = 3; i < HISTORY_SIZE / 2; i++) {
+                double real = dftOutput.at<cv::Vec2d>(i, 0)[0];
+                double imag = dftOutput.at<cv::Vec2d>(i, 0)[1];
+                double magnitude = sqrt(real*real + imag*imag);
+                
+                if (magnitude > maxVal) {
+                    maxVal = magnitude;
+                    maxIndex = i;
+                }
+            }
+
+            double fps = 30.0; 
+            raw_hz = maxIndex * (fps / HISTORY_SIZE);
+        }
+
+        // SMOOTHING FIX 2: "The Gate"
+        // If intensity is very low (< 2.0), force RPM to 0. 
+        // This stops the meter from showing random numbers when looking at a wall.
+        if (smoothed_score < 2.0) {
+            raw_hz = 0.0;
+        }
+
+        // SMOOTHING FIX 3: Averaging the RPM
+        // RPM changes slowly. We use a "heavier" smoothing (90% old, 10% new).
+        if (raw_hz > 0.1) {
+            smoothed_hz = (smoothed_hz * 0.9) + (raw_hz * 0.1);
+        } else {
+            smoothed_hz = 0.0; // Instant drop if 0
+        }
+
+        *frequencyHz = smoothed_hz;
+
+        // --- PART C: VISUALIZATION ---
+        cv::Mat mask;
+        int safe_thresh = (sensitivity < 1) ? 1 : (sensitivity > 255 ? 255 : sensitivity);
+        cv::threshold(diff, mask, safe_thresh, 255, cv::THRESH_BINARY);
+        cv::dilate(mask, mask, cv::Mat(), cv::Point(-1, -1), 2);
+        
+        cv::Mat heatmap;
+        cv::applyColorMap(mask, heatmap, cv::COLORMAP_JET); 
+        
+        cv::Mat color_input;
+        cv::cvtColor(gray, color_input, cv::COLOR_GRAY2BGR);
+
+        cv::Mat output;
+        cv::addWeighted(color_input, 0.7, heatmap, 0.5, 0, output);
+
+        std::vector<uchar> buf;
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 60};
+        cv::imencode(".jpg", output, buf, params);
+
+        memcpy(outputBytes, buf.data(), buf.size());
+        gray.copyTo(prev_gray);
+
+        return (int)buf.size();
+    }
+}
