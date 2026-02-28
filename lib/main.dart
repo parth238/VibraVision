@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'dart:async';
-
 import 'services/native_bridge.dart';
+import 'package:http/http.dart' as http; // NEW: HTTP package for GenTwin
+import 'dart:convert'; // NEW: JSON encoding for GenTwin
 
 List<CameraDescription> _cameras = [];
 
@@ -51,6 +52,11 @@ class _VisionScreenState extends State<VisionScreen>
   bool _isStreamStopped = false; // Guard against double stopImageStream
   int _selectedFps = 60;
   final TextEditingController _rpmController = TextEditingController();
+
+  // --- GENTWIN API VARIABLES ---
+  bool _isSyncing = false;
+  double _finalPeakFrequency = 0.0;
+  double _finalIntensity = 0.0;
 
   ProcessingResult? _finalResult;
 
@@ -108,6 +114,55 @@ class _VisionScreenState extends State<VisionScreen>
     });
   }
 
+  // ==========================================
+  // GENTWIN AI: TELEMETRY SYNC HTTP POST
+  // ==========================================
+  Future<void> _syncToGenTwin() async {
+    setState(() => _isSyncing = true);
+
+    // 🔴 BRUTALLY HONEST WARNING: Change this IP to your laptop's actual Wi-Fi IPv4 address!
+    // If you leave it as 192.168.X.X, the app will crash when you hit the button.
+    final String backendUrl = 'http://10.121.3.156:3000/api/telemetry';
+
+    try {
+      final response = await http.post(
+        Uri.parse(backendUrl),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'frequency': _finalPeakFrequency,
+          'intensity': _finalIntensity,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('✅ Telemetry Sent to GenTwin Dashboard!'),
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 2),
+            ),
+          );
+        }
+      } else {
+        debugPrint('[-] GenTwin Server Error: ${response.statusCode}');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              '❌ Network Error: Is the GenTwin Node server running?',
+            ),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isSyncing = false);
+    }
+  }
+
   // =========================================================================
   // 1. THE TRIPLE TAP LOGIC (Restored)
   // =========================================================================
@@ -138,6 +193,9 @@ class _VisionScreenState extends State<VisionScreen>
     if (mounted) {
       setState(() {
         _finalResult = result;
+        // UPDATE GENTWIN VARIABLES
+        _finalPeakFrequency = result.peakFrequency;
+        _finalIntensity = result.peakMagnitude;
         _isRecording = false;
       });
       ScaffoldMessenger.of(context).showSnackBar(
@@ -205,6 +263,9 @@ class _VisionScreenState extends State<VisionScreen>
           if (mounted) {
             setState(() {
               _finalResult = result;
+              // UPDATE GENTWIN VARIABLES
+              _finalPeakFrequency = result.peakFrequency;
+              _finalIntensity = result.peakMagnitude;
               _isRecording = false;
             });
           }
@@ -463,6 +524,39 @@ class _VisionScreenState extends State<VisionScreen>
                 padding: const EdgeInsets.symmetric(vertical: 15),
               ),
             ),
+
+          const SizedBox(height: 15),
+
+          // --- THE NEW GENTWIN SYNC BUTTON ---
+          ElevatedButton.icon(
+            onPressed: _isSyncing ? null : _syncToGenTwin,
+            icon: _isSyncing
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      color: Colors.white,
+                      strokeWidth: 2,
+                    ),
+                  )
+                : const Icon(Icons.auto_graph, color: Colors.white),
+            label: Text(
+              _isSyncing ? "TRANSMITTING..." : "SYNC TO GENTWIN & DIAGNOSE",
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1,
+              ),
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blueAccent,
+              disabledBackgroundColor: Colors.grey.shade800,
+              padding: const EdgeInsets.symmetric(vertical: 15),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+          ),
 
           const SizedBox(height: 15),
 
